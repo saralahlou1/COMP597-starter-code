@@ -51,8 +51,8 @@ class Trainer(ABC):
                  loader : data.DataLoader, 
                  device : torch.device, 
                  stats : stats.TrainerStats = stats.NOOPTrainerStats(), 
-                 enable_checkpointing : bool = False,
-                 checkpoint_frequency : int = 1):
+                 enable_checkpointing : bool = True,
+                 checkpoint_frequency : int = 10):
         self.model = model
         self.loader = loader
         self.device = device
@@ -88,7 +88,7 @@ class Trainer(ABC):
             This is the iteration number.
 
         """
-        return "checkpoint.tar"
+        return "/tmp/checkpoint.tar"
 
     # TODO(Olivier) Consider adding the loss to the checkpoint.
     def checkpoint_dict(self, i : int) -> Dict[str,Any]:
@@ -260,12 +260,20 @@ class Trainer(ABC):
         for i, batch in enumerate(self.loader):
             self.stats.start_step()
             loss, descr = self.step(i, batch, model_kwargs)
-            self.stats.stop_step()
+            #self.stats.stop_step()
 
             if self.enable_checkpointing and self.should_save_checkpoint(i):
                 self.stats.start_save_checkpoint()
-                self.save_checkpoint(i)
-                self.stats.stop_save_checkpoint()
+                try:
+                    self.save_checkpoint(i)
+                except Exception:
+                    print("Checkpoint failed")
+                finally:
+                    self.stats.stop_save_checkpoint()
+                #self.save_checkpoint(i)
+                #self.stats.stop_save_checkpoint()
+
+            self.stats.stop_step()
 
             # for every rank, log the loss
             self.stats.log_loss(loss)

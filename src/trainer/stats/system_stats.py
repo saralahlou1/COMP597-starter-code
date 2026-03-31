@@ -5,17 +5,11 @@ import os
 from typing import Optional, Dict, Any, List
 
 import psutil
+import threading   # NEW
 
 # optional libs (guarded)
-try:
-    import torch
-except Exception:
-    torch = None
-
-try:
-    import pynvml
-except Exception:
-    pynvml = None
+import torch
+import pynvml
 
 from src.trainer.stats.base import TrainerStats as BaseTrainerStats
 
@@ -27,10 +21,7 @@ def construct_trainer_stats(conf : config.Config, **kwargs) -> base.TrainerStats
 
 def _init_nvml_once():
     """Return True if NVML initialized (or already init failed)."""
-    if pynvml is None:
-        return False
     try:
-        # safe to call multiple times in practice; guard with try/except
         pynvml.nvmlInit()
         return True
     except Exception:
@@ -49,11 +40,9 @@ def _safe_gpu_util_and_mem():
         "torch_reserved_bytes": None,
     }
 
-    # torch.cuda gives per-process memory (if torch present and cuda available)
     if torch is not None and torch.cuda.is_available():
         info["gpu_present"] = True
         try:
-            # device 0 (assumption: training uses single GPU)
             info["torch_allocated_bytes"] = int(torch.cuda.memory_allocated(0))
             info["torch_reserved_bytes"] = int(torch.cuda.memory_reserved(0))
         except Exception:
@@ -133,11 +122,10 @@ class SimpleSystemStats(BaseTrainerStats):
       - after_checkpoint (sample at stop_save_checkpoint)
     """
 
-    def __init__(self):
+    def __init__(self, checkpoint_sampling_interval: float = 0.1):
         """
         Args:
-            out_path: path to write stats at the end. If suffix is .jsonl or .ndjson,
-                      will write one JSON object per line. Otherwise writes a JSON array.
+            checkpoint_sampling_interval: interval (seconds) between checkpoint samples.
         """
         self.out_path = "training_stats.json"
         self.rows: List[Dict[str, Any]] = []
@@ -160,10 +148,16 @@ class SimpleSystemStats(BaseTrainerStats):
         self._epoch_idx = 0
         self._running = False
 
+        # --- checkpoint sampler thread state (NEW) ---
+        self._checkpoint_sampling_interval = checkpoint_sampling_interval
+        self._checkpoint_sampling = False
+        self._checkpoint_thread: Optional[threading.Thread] = None
+        self._checkpoint_samples: List[Dict[str, Any]] = []
+        self._checkpoint_lock = threading.Lock()
+
     # ---------- life-cycle ----------
     def start_train(self) -> None:
         self._running = True
-        # init NVML once if installed (harmless if fails)
         if pynvml is not None:
             try:
                 pynvml.nvmlInit()
@@ -183,10 +177,8 @@ class SimpleSystemStats(BaseTrainerStats):
                 with open(self.out_path, "w") as f:
                     json.dump(self.rows, f, indent=2)
         except Exception as e:
-            # best-effort: print error but do not crash training
             print(f"[SimpleSystemStats] failed to write stats to {self.out_path}: {e}")
 
-        # try to shutdown NVML if we initialized it
         if pynvml is not None:
             try:
                 pynvml.nvmlShutdown()
@@ -233,10 +225,8 @@ class SimpleSystemStats(BaseTrainerStats):
                 "after_checkpoint": self._after_checkpoint,
             }
         }
-        # append to memory
         self.rows.append(row)
 
-        # reset transient markers for next step
         self._before_sample = None
         self._after_forward = None
         self._after_backward = None
@@ -244,7 +234,6 @@ class SimpleSystemStats(BaseTrainerStats):
         self._after_checkpoint = None
         self._ts_step_start = None
 
-        # call log_step hook (no-op by default)
         self.log_step()
 
     def start_forward(self) -> None:
@@ -298,23 +287,80 @@ class SimpleSystemStats(BaseTrainerStats):
             "gpu": _safe_gpu_util_and_mem(),
         }
 
+    # ---------- checkpoint sampler (NEW) ----------
+    def _checkpoint_sampler_loop(self):
+        """Background loop run during checkpointing to collect host/gpu samples."""
+        try:
+            while self._checkpoint_sampling:
+                now = time.time()
+                sample = {
+                    "time": now,
+                    "host_process": _sample_host_process(),
+                    "gpu": _safe_gpu_util_and_mem(),
+                }
+                # append under lock
+                with self._checkpoint_lock:
+                    self._checkpoint_samples.append(sample)
+                time.sleep(self._checkpoint_sampling_interval)
+        except Exception:
+            # keep best-effort semantics: don't raise from the thread
+            return
+
     def start_save_checkpoint(self) -> None:
+        """Start checkpointing and begin background sampling thread for the checkpoint."""
+        # record start timestamp as before
         self._ts_checkpoint_start = time.time()
+        # clear any previous checkpoint samples
+        with self._checkpoint_lock:
+            self._checkpoint_samples = []
+        # start background sampler thread
+        self._checkpoint_sampling = True
+        t = threading.Thread(target=self._checkpoint_sampler_loop, daemon=True)
+        self._checkpoint_thread = t
+        t.start()
 
     def stop_save_checkpoint(self) -> None:
+        """Stop checkpointing and stop/join the sampling thread; store the collected samples."""
+        # synchronize GPU work first (as before)
         torch.cuda.synchronize()
+
+        # stop the background sampler
+        self._checkpoint_sampling = False
+
+        # assemble duration and include the collected samples
         now = time.time()
         dur = now - self._ts_checkpoint_start if self._ts_checkpoint_start else None
+
+        if self._checkpoint_thread is not None:
+            # join with a timeout to avoid blocking forever
+            self._checkpoint_thread.join(timeout=max(2.0, self._checkpoint_sampling_interval * 5.0))
+            self._checkpoint_thread = None
+
+        # copy samples out under lock
+        with self._checkpoint_lock:
+            samples_copy = list(self._checkpoint_samples)
+            # optionally clear the stored list
+            # self._checkpoint_samples = []
+
+        # last host/gpu snapshot (best-effort: take last sample if available, otherwise do one final sample)
+        if samples_copy:
+            last_sample = samples_copy[-1]
+            host_snapshot = last_sample.get("host_process")
+            gpu_snapshot = last_sample.get("gpu")
+        else:
+            host_snapshot = _sample_host_process()
+            gpu_snapshot = _safe_gpu_util_and_mem()
+
         self._after_checkpoint = {
             "time": now,
             "duration_s": dur,
-            "host_process": _sample_host_process(),
-            "gpu": _safe_gpu_util_and_mem(),
+            "host_process": host_snapshot,
+            "gpu": gpu_snapshot,
+            "checkpoint_samples": samples_copy,
         }
 
     # ---------- logging hooks ----------
     def log_step(self) -> None:
-        # no-op by default. Subclass to push to TB/W&B if desired.
         pass
 
     def log_stats(self) -> None:
@@ -325,4 +371,3 @@ class SimpleSystemStats(BaseTrainerStats):
             print(f"[SimpleSystemStats] collected {n} steps. last_loss={last_loss}")
         except Exception:
             pass
-

@@ -224,7 +224,9 @@ class CodeCarbonStats(base.TrainerStats):
 
         # sampling thread control
         self._sampling_stop_event = threading.Event()
+        self._checkpoint_stop_event = threading.Event()
         self._sampling_thread = threading.Thread(target=self._sampling_loop, name=f"cc-sampler-run{run_num}-gpu{gpu_id}", daemon=True)
+        self._checkpoint_thread = None
         self._sampling_thread_started = False
 
     def _sampling_loop(self):
@@ -328,18 +330,69 @@ class CodeCarbonStats(base.TrainerStats):
 
     # --- explicit checkpoint tasks so they appear in the samples CSV as named events ---
     def start_save_checkpoint(self) -> None:
+        """Start sampling the checkpoint period every self.sample_interval_s seconds
+        and emit tasks into the training_substep_tracker.
+        """
         torch.cuda.synchronize(self.device)
-        try:
-            self.sampling_tracker.start_task(task_name = f"checkpoint_iter_{self.iteration}")
-        except Exception as e:
-            logger.warning(f"Failed to start checkpoint sampling task: {e}")
+
+        # if a previous checkpoint sampling is still active, warn and skip
+        if getattr(self, "_checkpoint_thread", None) and self._checkpoint_thread.is_alive():
+            logger.warning("Checkpoint sampling thread already running; ignoring start_save_checkpoint call.")
+            return
+
+        # control event for the thread
+        self._checkpoint_stop_event = threading.Event()
+
+        def _checkpoint_sampling_loop():
+            sample_idx = 0
+            while not self._checkpoint_stop_event.is_set():
+                task_name = f"Checkpoint step #{self.iteration}_sample_{sample_idx}"
+                try:
+                    self.training_substep_tracker.start_task(task_name=task_name)
+                except Exception as e:
+                    logger.warning(f"Failed to start checkpoint sample task: {e}")
+                # wait but allow early exit
+                stopped_early = self._checkpoint_stop_event.wait(self.sample_interval_s)
+                try:
+                    self.training_substep_tracker.stop_task(task_name=task_name)
+                except Exception as e:
+                    logger.warning(f"Failed to stop checkpoint sample task: {e}")
+                sample_idx += 1
+                if stopped_early:
+                    break
+
+        # start the thread
+        self._checkpoint_thread = threading.Thread(
+            target=_checkpoint_sampling_loop,
+            name=f"cc-checkpoint-sampler-run{self.run_num}-gpu{getattr(self.device, 'index', 0)}",
+            daemon=True,
+        )
+        self._checkpoint_thread.start()
 
     def stop_save_checkpoint(self) -> None:
+        """Stop the checkpoint sampling loop and join the thread."""
         torch.cuda.synchronize(self.device)
+
+        if getattr(self, "_checkpoint_stop_event", None) is None:
+            # nothing to stop
+            return
+
+        # signal the thread to stop
+        self._checkpoint_stop_event.set()
+
+        # join with a short timeout so shutdown isn't blocked forever
         try:
-            self.sampling_tracker.stop_task(task_name = f"checkpoint_iter_{self.iteration}")
+            if getattr(self, "_checkpoint_thread", None):
+                self._checkpoint_thread.join(timeout=5.0)
         except Exception as e:
-            logger.warning(f"Failed to stop checkpoint sampling task: {e}")
+            logger.warning(f"Failed to join checkpoint sampling thread: {e}")
+
+        # cleanup attributes
+        try:
+            del self._checkpoint_stop_event
+            del self._checkpoint_thread
+        except Exception:
+            pass
 
     def log_step(self) -> None:
         pass

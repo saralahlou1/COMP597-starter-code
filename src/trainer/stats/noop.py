@@ -1,6 +1,8 @@
 import src.config as config
 import src.trainer.stats.base as base
 import torch
+import time
+
 
 trainer_stats_name="noop"
 
@@ -17,12 +19,15 @@ class NOOPTrainerStats(base.TrainerStats):
 
     def __init__(self) -> None:
         super().__init__()
+        self._train_start_time = None
+        self.train_duration = None
 
     def start_train(self) -> None:
-        pass
+        self._train_start_time = time.time()
 
     def stop_train(self) -> None:
-        pass
+        self.train_duration = time.time() - self._train_start_time
+        print(f"Training took {self.train_duration:.3f} seconds")
 
     def start_step(self) -> None:
         pass
