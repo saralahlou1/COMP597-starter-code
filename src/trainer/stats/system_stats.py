@@ -187,12 +187,29 @@ class SimpleSystemStats(BaseTrainerStats):
 
     # ---------- step / phase methods ----------
     def start_step(self) -> None:
+        # stop the background sampler
+        self._checkpoint_sampling = False
+
+        # assemble duration and include the collected samples
+        now = time.time()
+        dur = now - self._ts_checkpoint_start if self._ts_checkpoint_start else None
+
+        if self._checkpoint_thread is not None:
+            # join with a timeout to avoid blocking forever
+            self._checkpoint_thread.join(timeout=max(2.0, self._checkpoint_sampling_interval * 5.0))
+            self._checkpoint_thread = None
+
+        # copy samples out under lock
+        with self._checkpoint_lock:
+            samples_copy = list(self._checkpoint_samples)
+
         self._step_idx += 1
         self._ts_step_start = time.time()
         self._before_sample = {
             "time": self._ts_step_start,
             "host_process": _sample_host_process(),
             "gpu": _safe_gpu_util_and_mem(),
+            "dataloading_samples": samples_copy
         }
         # Clear other phase samples
         self._after_forward = None
@@ -286,6 +303,14 @@ class SimpleSystemStats(BaseTrainerStats):
             "host_process": _sample_host_process(),
             "gpu": _safe_gpu_util_and_mem(),
         }
+        with self._checkpoint_lock:
+            self._checkpoint_samples = []
+        # start background sampler thread
+        self._checkpoint_sampling = True
+        t = threading.Thread(target=self._checkpoint_sampler_loop, daemon=True)
+        self._checkpoint_thread = t
+        t.start()
+
 
     # ---------- checkpoint sampler (NEW) ----------
     def _checkpoint_sampler_loop(self):
