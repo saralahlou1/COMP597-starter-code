@@ -5,9 +5,8 @@ import os
 from typing import Optional, Dict, Any, List
 
 import psutil
-import threading   # NEW
+import threading   
 
-# optional libs (guarded)
 import torch
 import pynvml
 
